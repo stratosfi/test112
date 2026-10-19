@@ -1,0 +1,70 @@
+# The CI of an application on GrayFactory. Nothing here is a secret: the
+# GF_* Actions variables (written by the platform) say where to register.
+# No ${{ }} is ever expanded inside a script: every value reaches the
+# shell through env and is validated before it is used.
+name: grayfactory
+on:
+  push: { branches: [main], tags: ["v*"] }
+  workflow_dispatch: { inputs: { build_id: { type: string, required: false } } }
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write, packages: write }
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      GF_API_URL: ${{ vars.GF_API_URL }}
+      GF_AUDIENCE: ${{ vars.GF_AUDIENCE }}
+      GF_BUILD_HOOK: ${{ vars.GF_BUILD_HOOK }}
+      GF_APPLICATION_ID: ${{ vars.GF_APPLICATION_ID }}
+    steps:
+      - name: Validate the inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [[ -n "$BUILD_ID" && ! "$BUILD_ID" =~ $uuid ]]; then echo "build_id is not a UUID" >&2; exit 1; fi
+          [[ "$GF_APPLICATION_ID" =~ $uuid ]] || { echo "GF_APPLICATION_ID is not a UUID" >&2; exit 1; }
+          [[ "$GF_API_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || { echo "GF_API_URL is not an https origin" >&2; exit 1; }
+          [[ "$GF_AUDIENCE" == "$GF_API_URL"/tenants/* && "${GF_AUDIENCE#"$GF_API_URL"/tenants/}" =~ $uuid ]] || { echo "GF_AUDIENCE is not a tenant of GF_API_URL" >&2; exit 1; }
+          [[ "$GF_BUILD_HOOK" =~ ^/v0/workflow/hooks/[0-9a-f-]{36}$ ]] || { echo "GF_BUILD_HOOK is not a hook path" >&2; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: Build and push the image (GHCR, by digest)
+        id: image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t "$image:$GITHUB_SHA" .
+          docker push "$image:$GITHUB_SHA"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | cut -d@ -f2)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no digest" >&2; exit 1; }
+          echo "ref=$image@$digest" >> "$GITHUB_OUTPUT"
+      - name: GrayFactory token (OIDC, bound to this application)
+        id: gf
+        shell: bash
+        run: |
+          set -euo pipefail
+          idt=$(curl -fsS -G "$ACTIONS_ID_TOKEN_REQUEST_URL" --data-urlencode "audience=$GF_AUDIENCE" -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" | jq -r .value)
+          tok=$(curl -fsS -X POST "$GF_API_URL/v0/sts/token" \
+            --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+            --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+            --data-urlencode "subject_token=$idt" | jq -r .access_token)
+          echo "::add-mask::$tok"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+      - name: Register the build
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          GF_TOKEN: ${{ steps.gf.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || { echo "the image is not a digest of GHCR" >&2; exit 1; }
+          jq -n --arg app "$GF_APPLICATION_ID" --arg sha "$GITHUB_SHA" --arg ref "$IMAGE_REF" --arg build "$BUILD_ID" \
+            --arg event "gh-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            '{event_id: $event, application_id: $app, commit: {sha: $sha}, status: "successful", assets: [{name: "web", kind: "docker-image", ref: $ref, port: 8080}]} + (if $build == "" then {} else {build_id: $build} end)' > build.json
+          curl -fsS -X POST "$GF_API_URL$GF_BUILD_HOOK" -H "Authorization: Bearer $GF_TOKEN" -H 'Content-Type: application/json' --data @build.json
